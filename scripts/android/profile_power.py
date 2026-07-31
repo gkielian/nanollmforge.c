@@ -5,7 +5,7 @@ import argparse
 import sys
 import os
 
-DEFAULT_ADB = os.environ.get("ADB", "/Users/xintingj/Library/Android/sdk/platform-tools/adb")
+DEFAULT_ADB = os.environ.get("ADB", "${HOME}/Library/Android/sdk/platform-tools/adb")
 
 def read_battery_stats(adb_cmd, serial=None):
     """
