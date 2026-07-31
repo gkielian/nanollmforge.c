@@ -27,6 +27,11 @@
 # Exported GPT-2 tokenizer table (regenerable via reallmforge/export_gpt2_tokenizer.py)
 /tokenizer_gpt2.bin
 
+# TFLite / LiteRT converted models + calibration caches (large, regenerable; see tflite/).
+# Scratch exports anywhere are ignored, EXCEPT any bundled example under models/.
+*.tflite
+!models/**/*.tflite
+
 # Bundled model weights: too large for a public fork (GitHub blocks >100MB, and this fork
 # disallows Git LFS). Distributed via GitHub Releases instead — see reallmforge/fetch_model.sh.
 # models/**/*.q8.bin
@@ -39,3 +44,12 @@ __pycache__/
 /ref_out.txt
 /c_out.txt
 /*_ids.txt
+
+# pytest (training/test_all.py) scratch + downloaded fixtures (written at repo root)
+/err.txt
+/stdout.txt
+/test/
+
+# Claude Code: track CLAUDE.md + .claude/commands/ (shared), ignore only personal settings
+.claude/
+CLAUDE.md

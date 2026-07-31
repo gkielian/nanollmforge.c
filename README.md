@@ -14,11 +14,11 @@
 
 Have you ever wanted to inference a baby [Llama 2](https://ai.meta.com/llama/) model in pure C? No? Well, now you can!
 
-Train the Llama 2 LLM architecture in PyTorch then inference it with one simple 700-line C file ([run.c](run.c)). You might think that you need many billion parameter LLMs to do anything useful, but in fact very small LLMs can have surprisingly strong performance if you make the domain narrow enough (ref: [TinyStories](https://huggingface.co/datasets/roneneldan/TinyStories) paper). This repo is a "fullstack" train + inference solution for Llama 2 LLM, with focus on minimalism and simplicity.
+Train the Llama 2 LLM architecture in PyTorch then inference it with one simple 700-line C file ([run.c](src/run.c)). You might think that you need many billion parameter LLMs to do anything useful, but in fact very small LLMs can have surprisingly strong performance if you make the domain narrow enough (ref: [TinyStories](https://huggingface.co/datasets/roneneldan/TinyStories) paper). This repo is a "fullstack" train + inference solution for Llama 2 LLM, with focus on minimalism and simplicity.
 
 As the architecture is identical, you can also load and inference Meta's Llama 2 models. However, the current code only inferences models in fp32, so you will most likely not be able to productively load models larger than 7B. Work on model quantization is currently ongoing.
 
-Please note that this repo started recently as a fun weekend project: I took my earlier [nanoGPT](https://github.com/karpathy/nanoGPT), tuned it to implement the Llama-2 architecture instead of GPT-2, and the meat of it was writing the C inference engine in [run.c](run.c). So the project is young and moving quickly. Hat tip to the awesome [llama.cpp](https://github.com/ggerganov/llama.cpp) for inspiring this project. Compared to llama.cpp, I wanted something super simple, minimal, and educational so I chose to hard-code the Llama 2 architecture and just roll one inference file of pure C with no dependencies.
+Please note that this repo started recently as a fun weekend project: I took my earlier [nanoGPT](https://github.com/karpathy/nanoGPT), tuned it to implement the Llama-2 architecture instead of GPT-2, and the meat of it was writing the C inference engine in [run.c](src/run.c). So the project is young and moving quickly. Hat tip to the awesome [llama.cpp](https://github.com/ggerganov/llama.cpp) for inspiring this project. Compared to llama.cpp, I wanted something super simple, minimal, and educational so I chose to hard-code the Llama 2 architecture and just roll one inference file of pure C with no dependencies.
 
 ## feel the magic
 
@@ -78,7 +78,7 @@ As the neural net architecture is identical, we can also inference the Llama 2 m
 For this we need to install the python dependencies (`pip install -r requirements.txt`) and then use the `export.py` file, e.g. for 7B model:
 
 ```bash
-python export.py llama2_7b.bin --meta-llama path/to/llama/model/7B
+python pytorch/export.py llama2_7b.bin --meta-llama path/to/llama/model/7B
 ```
 
 The export will take ~10 minutes or so and generate a 26GB file (the weights of the 7B model in float32) called `llama2_7b.bin` in the current directory. It has been [reported](https://github.com/karpathy/llama2.c/pull/85) that despite efforts. I would not attempt to run anything above 7B right now for two reasons: first, 13B+ currently doesn't work because of integer flow in pointer arithmetic, which is yet to be fixed, and second, even if it were fixed, this repo is doing float32 inference right now, so it would be fairly unusably slow. Once the export is done, we can run it:
@@ -96,7 +96,7 @@ base models... ¯\\_(ツ)_/¯. Since we can inference the base model, it should 
 You can also chat with the Llama Chat models. Export the chat model exactly as above:
 
 ```bash
-python export.py llama2_7b_chat.bin --meta-llama /path/to/7B-chat
+python pytorch/export.py llama2_7b_chat.bin --meta-llama /path/to/7B-chat
 ```
 
 Then chat with it by specifying the chat mode using the `-m` flag, e.g.:
@@ -108,33 +108,33 @@ Then chat with it by specifying the chat mode using the `-m` flag, e.g.:
 You can also try Meta's Code Llama models even if support for them is incomplete. In particular, some hyperparameters changed (e.g. the constant in RoPE layer), so the inference is not exactly correct and a bit buggy right now. Looking into fixes. Make sure to build the tokenizer for the plain and instruct variants and pass it when doing inference.
 
 ```bash
-python export.py codellama2_7b.bin --meta-llama /path/to/CodeLlama-7b
-python tokenizer.py --tokenizer-model=/path/to/CodeLlama-7b/tokenizer.model
+python pytorch/export.py codellama2_7b.bin --meta-llama /path/to/CodeLlama-7b
+python pytorch/tokenizer.py --tokenizer-model=/path/to/CodeLlama-7b/tokenizer.model
 ./run codellama2_7b.bin -z /path/to/CodeLlama-7b/tokenizer.bin
 ```
 
 Chat with Code Llama Instruct:
 
 ```bash
-python export.py codellama2_7b_instruct.bin --meta-llama /path/to/CodeLlama-7b-Instruct
-python tokenizer.py --tokenizer-model=/path/to/CodeLlama-7b-Instruct/tokenizer.model
+python pytorch/export.py codellama2_7b_instruct.bin --meta-llama /path/to/CodeLlama-7b-Instruct
+python pytorch/tokenizer.py --tokenizer-model=/path/to/CodeLlama-7b-Instruct/tokenizer.model
 ./run codellama2_7b_instruct.bin -m chat -z /path/to/CodeLlama-7b-Instruct/tokenizer.bin
 ```
 
 ## int8 quantization
 
-The (default) script [run.c](run.c), above, uses a float32 forward pass, where the entire calculation of the forward pass is kept in fp32. This is very easy to understand as far as reference code goes, but it has the following downsides: the model checkpoint files are very large (it takes 4 bytes per every individual weight), and the forward pass is relatively slow. The (very) common inference optimization employed in practice is to quantize the model parameters to lower precision, giving up a little bit of correctness in return for smaller checkpoint sizes and faster forward passes (as most of the inference uses integer arithmetic). Empirically, LLMs can tolerate precisions as low as 4-bit (or even lower), but we use int8 here because it is a "safe" setting that gets us the benefits but doesn't sacrifice too much of the model accuracy. Only the weights that participate in matmuls are quantized. All the other parameters (e.g. especially the scale and bias in RMSNorm) are kept in float32, because these layers are very sensitive. Now, if all you're after is reduction in checkpoint sizes, you could quantize the weights, save the checkpoint, and then dequantize them in run.c, and do float32 inference as normal and call it a day. This is totally fine. But here, we go one step further (as is standard practice) and additionally quantize the activations in the forward pass. This requires us to dynamically quantize and dequantize between float32 and int8 at runtime, which adds overhead. But the benefit is that now the majority of the calculations (the matmuls especially!) are using pure integer arithmetic, where both weights and activations enter as int8. This is where the speedups can fundamentally come from. The version we use is the "Q8_0" quantization (llama.cpp terminology), where the 0 means that the weight quantization is symmetric around 0, quantizing to the range [-127, 127].
+The (default) script [run.c](src/run.c), above, uses a float32 forward pass, where the entire calculation of the forward pass is kept in fp32. This is very easy to understand as far as reference code goes, but it has the following downsides: the model checkpoint files are very large (it takes 4 bytes per every individual weight), and the forward pass is relatively slow. The (very) common inference optimization employed in practice is to quantize the model parameters to lower precision, giving up a little bit of correctness in return for smaller checkpoint sizes and faster forward passes (as most of the inference uses integer arithmetic). Empirically, LLMs can tolerate precisions as low as 4-bit (or even lower), but we use int8 here because it is a "safe" setting that gets us the benefits but doesn't sacrifice too much of the model accuracy. Only the weights that participate in matmuls are quantized. All the other parameters (e.g. especially the scale and bias in RMSNorm) are kept in float32, because these layers are very sensitive. Now, if all you're after is reduction in checkpoint sizes, you could quantize the weights, save the checkpoint, and then dequantize them in run.c, and do float32 inference as normal and call it a day. This is totally fine. But here, we go one step further (as is standard practice) and additionally quantize the activations in the forward pass. This requires us to dynamically quantize and dequantize between float32 and int8 at runtime, which adds overhead. But the benefit is that now the majority of the calculations (the matmuls especially!) are using pure integer arithmetic, where both weights and activations enter as int8. This is where the speedups can fundamentally come from. The version we use is the "Q8_0" quantization (llama.cpp terminology), where the 0 means that the weight quantization is symmetric around 0, quantizing to the range [-127, 127].
 
-The quantized forward pass is implemented in [runq.c](runq.c). To use it, we have to export the model in the quantized format. For example, the float32 version of Llama 2 7B was exported as:
+The quantized forward pass is implemented in [runq.c](src/runq.c). To use it, we have to export the model in the quantized format. For example, the float32 version of Llama 2 7B was exported as:
 
 ```
-python export.py llama2_7b.bin --meta-llama path/to/llama/model/7B
+python pytorch/export.py llama2_7b.bin --meta-llama path/to/llama/model/7B
 ```
 
 This creates a 26GB file, because each one of 7B parameters is 4 bytes (fp32). To export it quantized, we instead use version 2 export:
 
 ```
-python export.py llama2_7b_q80.bin --version 2 --meta-llama path/to/llama/model/7B
+python pytorch/export.py llama2_7b_q80.bin --version 2 --meta-llama path/to/llama/model/7B
 ```
 
 This runs for a few minutes, but now creates only a 6.7GB file. For exporting non-meta checkpoints you would use the --checkpoint arg instead of --meta-llama arg (more docs on this later, below). Now let's inference them. I like to use OMP here because these are big models, so e.g. on my Linux box:
@@ -169,14 +169,14 @@ You'll notice that the 110M model is equivalent to GPT-1 in size. Alternatively,
 Let's see how we can train a baby Llama 2 from scratch using the code in this repo. First let's download and pretokenize some source dataset, e.g. I like [TinyStories](https://huggingface.co/datasets/roneneldan/TinyStories) so this is the only example currently available in this repo. But it should be very easy to add datasets, see the code.
 
 ```bash
-python tinystories.py download
-python tinystories.py pretokenize
+python pytorch/tinystories.py download
+python pytorch/tinystories.py pretokenize
 ```
 
 Then train our model:
 
 ```bash
-python train.py
+python pytorch/train.py
 ```
 
 **brief training guide**. See the train.py script for more exotic launches and hyperparameter overrides. Here is a brief guide to how to set the parameters. Look at the table at the very end of the [Chinchilla paper](https://arxiv.org/abs/2203.15556) to get a sense of how the Transformer parameters (dim, n_layers, n_heads) grow or shrink together. Extrapolate/interpolate this pattern to get bigger or smaller transformers. Set the max context length however you wish, depending on the problem: this should be the max number of tokens that matter to predict the next token. E.g. Llama 2 uses 2048. Next, you want the _total_ batch size per update (printed by the script as "tokens per iteration will be:") to be somewhere around 100K tokens for medium-sized applications. For tiny applications it could be lower, for large training (e.g. GPTs/LLamas) it is usually ~0.5M, or even more. You get there by first maxing out the batch_size to whatever your system allows (e.g. mine was 16 in a recent run because after that my GPU runs out of memory), and then you want to increase gradient_accumulation_steps to be as high as necessary to reach the total batch size of ~100K. Finally, you want to tune your learning_rate (LR). You want this to be as high as your training allows. Very small networks can get away with a large LR (e.g. 1e-3 or even higher). Large networks need lower LRs. 3e-4 is a safe choice in most medium-sized applications, but can be too low for small networks, so try to increase it! Finally, max_iters is the length of training. Play with different settings. I mostly only ever tune these parameters and leave most of the others unchanged. Here is an example of how I trained the 110M model, which I don't think is anywhere near optimal, but looked sensible to me: dim 768, n_layers 12, n_heads 12 (so size of each head is 768 / 12 = 64 channels), seq len of 1024, batch size 16 (this is the most that fit my A100 40GB GPU), gradient_accumulation_steps = 8 was needed to get total tokens batch size to be 16 batch size * 1024 tokens in sequence * 8 grad_accum = 131,072 tokens per update. Good. Learning rate 4e-4 (probably a little too low). max_iters 200K (probably a bit too high). Dropout 0.1, as that usually helps a bit at medium size. That was it. I ran using Distributed Data Parallel (DDP) on 4 GPUs on my cloud machine, training took ~day or so.
@@ -203,7 +203,7 @@ Watch the tokens stream by, fun! We can also run the PyTorch inference script fo
 
 ```bash
 wget https://huggingface.co/karpathy/tinyllamas/resolve/main/stories15M.pt -P out15M
-python sample.py --checkpoint=out15M/stories15M.pt
+python pytorch/sample.py --checkpoint=out15M/stories15M.pt
 ```
 
 Which gives the same results.
@@ -215,16 +215,16 @@ In everything above, we've assumed the custom Lllama 2 tokenizer with 32,000 tok
 By default, to pretokenize the tinystories dataset we had to run, in order:
 
 ```
-python tinystories.py download
-python tinystories.py pretokenize
+python pytorch/tinystories.py download
+python pytorch/tinystories.py pretokenize
 ```
 
 The `pretokenize` stage here loads the Llama 2 tokenizer (vocab size 32,000) and uses it to convert the downloaded text into integers, and saves that to file. We now change this as follows, to train an example 4096-token tokenizer:
 
 ```
-python tinystories.py download
-python tinystories.py train_vocab --vocab_size=4096
-python tinystories.py pretokenize --vocab_size=4096
+python pytorch/tinystories.py download
+python pytorch/tinystories.py train_vocab --vocab_size=4096
+python pytorch/tinystories.py pretokenize --vocab_size=4096
 ```
 
 The `train_vocab` stage will call the `sentencepiece` library to train the tokenizer, storing it in a new file `data/tok4096.model`. I tried to reproduce as well as I could the settings that (I think) Meta used to train their vocabulary. This uses the Byte Pair Encoding algorithm that starts out with raw utf8 byte sequences of the text data and then iteratively merges the most common consecutive pairs of tokens to form the vocabulary. Inspect the `tinystories.py` file - the custom tokenizers are stored in a special directory structure indexed by the vocab size.
@@ -234,13 +234,13 @@ A quick note of interest is that vocab size of 4096 trained specifically on tiny
 Now that we have pretokenized the dataset with our custom tokenizer, we can train the model. The training script `train.py` doesn't care about the exact tokens, it only cares about the vocabulary size so it can correctly initialize the model. So when training your model, make sure to pass in
 
 ```
-python train.py --vocab_source=custom --vocab_size=4096
+python pytorch/train.py --vocab_source=custom --vocab_size=4096
 ```
 
 (The defaults are `llama2` and `32000` respectively, which indicates the default Llama 2 tokenizer). This trains the model. Finally we are ready to run inference with our `run.c` script. For that we need two things. Number one, we have to export our tokenizer in the `.bin` format, do that with:
 
 ```
-python tokenizer.py --tokenizer-model=data/tok4096.model
+python pytorch/tokenizer.py --tokenizer-model=data/tok4096.model
 ```
 
 This writes the tokenizer to `data/tok4096.bin`. Now we can run inference, pointing it to this tokenizer using the `-z` flag:
@@ -256,7 +256,7 @@ This should print the samples. If you leave out the `-z` flag, it will use the d
 There are many ways to potentially speed up this code depending on your system. Have a look at the [Makefile](Makefile), which contains a lot of notes. The `make run` command currently uses the `-O3` optimization by default, i.e.:
 
 ```bash
-gcc -O3 -o run run.c -lm
+gcc -O3 -o run src/run.c -lm
 ```
 
 -O3 includes optimizations that are expensive in terms of compile time and memory usage. Including vectorization, loop unrolling, and predicting branches.
@@ -275,7 +275,7 @@ If compiling with gcc, try experimenting with `-funroll-all-loops`, see PR [#183
 You'll need to install the OpenMP library and the clang compiler first (e.g. `apt install clang libomp-dev` on ubuntu). Then you can compile with `make runomp`, which does:
 
 ```bash
-clang -Ofast -fopenmp -march=native run.c  -lm  -o run
+clang -Ofast -fopenmp -march=native src/run.c  -lm  -o run
 ```
 
 When you run inference make sure to use OpenMP flags to set the number of threads, e.g.:
@@ -306,7 +306,7 @@ $ pytest
 
 This will currently invoke two tests inside `test_all.py`, which forward the model in both C and Python for 200 steps and check the output against a known good expected output. The tests currently run in only a few seconds, but will have to download and cache the stories260K models in a temporary `test` directory (only ~2MB download).
 
-There are also some tests in C, in the file [test.c](test.c). You can run these with `make testcc`, or to see more stuff printed:
+There are also some tests in C, in the file [test.c](src/test.c). You can run these with `make testcc`, or to see more stuff printed:
 
 ```
 make testcc VERBOSITY=1
@@ -413,7 +413,7 @@ If your candidate PRs have elements of these it doesn't mean they won't get merg
 
 - add support in run.c of reading version 1+ files from export, later deprecate "version 0"
 - run.cu (CUDA) investigate and merge
-- add more tests inside [test.c](test.c)
+- add more tests inside [test.c](src/test.c)
 - add Engine class for use in sample.py that does efficient inference in PyTorch, e.g. KV cache keeping
 - make it easier to add a new dataset with not too much pain
 - (LoRA) finetuning and export of Llama 2 models

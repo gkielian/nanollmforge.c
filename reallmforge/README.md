@@ -1,12 +1,12 @@
 # ReaLLM-Forge → llama2.c
 
 Tooling to export a model trained in [ReaLLM-Forge](https://github.com/) and run it in this
-pure-C engine (`run.c` / `runq.c`), including on Android. Full design, validation, and gate
+pure-C engine (`src/run.c` / `src/runq.c`), including on Android. Full design, validation, and gate
 results: [`../doc/reallmforge_to_llama2c.md`](../doc/reallmforge_to_llama2c.md).
 
 ## Files
-- `export_reallmforge.py` — ReaLLM-Forge `ckpt.pt` → llama2.c `.bin` (`--version 0` fp32 for run.c,
-  `--version 2` Q8_0 for runq.c). Validates the supported "Tier-1" architecture subset (uniform dims).
+- `export_reallmforge.py` — ReaLLM-Forge `ckpt.pt` → llama2.c `.bin` (`--version 0` fp32 for src/run.c,
+  `--version 2` Q8_0 for src/runq.c). Validates the supported "Tier-1" architecture subset (uniform dims).
 - `export_reallm_hetero.py` — ReaLLM-Forge `ckpt.pt` → `.rlm` (per-layer format) for **NSGA models with
   infinite-head attention**: heterogeneous per-layer dims, `infinite`/`identity` attention, GQA, peri-LN.
   `--version 1` fp32 (`make runreallm` → `./run_reallm model.rlm ...`, token-exact vs PyTorch);
@@ -20,7 +20,7 @@ results: [`../doc/reallmforge_to_llama2c.md`](../doc/reallmforge_to_llama2c.md).
 - `prove_parity.sh` — end-to-end proof the C engine == the original PyTorch model, token-for-token.
   `reallmforge/prove_parity.sh [CKPT_DIR] [PROMPT] [N_STEPS]`.
 
-The C-side tokenizer lives in `../bpe.h` (compiled into the engines); its unit test is `../bpe_test.c`.
+The C-side tokenizer lives in `../src/bpe.h` (compiled into the engines); its unit test is `../src/bpe_test.c`.
 
 ## Quickstart (desktop)
 ```bash

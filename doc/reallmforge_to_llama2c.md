@@ -243,8 +243,8 @@ adb shell 'cd /data/local/tmp && ./runq_android smollm2_135M_v2.bin -g tokenizer
 python reallmforge/export_reallmforge.py /home/xinting/Evo_GPT_checkpoints_backup/smollm2_135M smollm2_135M_v0.bin --version 0
 python reallmforge/export_reallmforge.py /home/xinting/Evo_GPT_checkpoints_backup/smollm2_135M smollm2_135M_v2.bin --version 2
 # build (GELU)
-gcc -O3 -DACT_GELU -o run_gelu  run.c  -lm
-gcc -O3 -DACT_GELU -o runq_gelu runq.c -lm
+gcc -O3 -DACT_GELU -o run_gelu  src/run.c  -lm
+gcc -O3 -DACT_GELU -o runq_gelu src/runq.c -lm
 # validate parity
 printf "464 2068 7586 21831\n" > ids.txt
 python reallmforge/ref_dump.py /home/xinting/Evo_GPT_checkpoints_backup/smollm2_135M ids.txt 32 2>/dev/null > ref_out.txt

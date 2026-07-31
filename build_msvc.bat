@@ -1,1 +1,1 @@
-cl.exe /fp:fast /Ox /openmp /I. run.c win.c 
+cl.exe /fp:fast /Ox /openmp /I. src/run.c src/win.c 
