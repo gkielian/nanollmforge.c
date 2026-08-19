@@ -326,6 +326,10 @@ void softmax(float* x, int size) {
     }
 }
 
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#include <arm_neon.h>
+#endif
+
 void matmul(float* xout, QuantizedTensor *x, QuantizedTensor *w, int n, int d) {
     // W (d,n) @ x (n,) -> xout (d,)
     // by far the most amount of time is spent inside this little function
@@ -334,26 +338,81 @@ void matmul(float* xout, QuantizedTensor *x, QuantizedTensor *w, int n, int d) {
     int i;
     #pragma omp parallel for private(i)
     for (i = 0; i < d; i++) {
-
         float val = 0.0f;
-        int32_t ival = 0;
         int in = i * n;
 
-        // do the matmul in groups of GS
-        int j;
-        for (j = 0; j <= n - GS; j += GS) {
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+        if (GS == 16) {
+            int num_groups = n / 16;
+            for (int g = 0; g < num_groups; g++) {
+                int j = g * 16;
+                int8x16_t vx = vld1q_s8(&x->q[j]);
+                int8x16_t vw = vld1q_s8(&w->q[in + j]);
+#if defined(__ARM_FEATURE_DOTPROD)
+                int32x4_t dot = vdotq_s32(vdupq_n_s32(0), vx, vw);
+                int32x2_t r = vadd_s32(vget_low_s32(dot), vget_high_s32(dot));
+                int32_t ival = vget_lane_s32(r, 0) + vget_lane_s32(r, 1);
+#else
+                int16x8_t p0 = vmull_s8(vget_low_s8(vx), vget_low_s8(vw));
+                int16x8_t p1 = vmull_s8(vget_high_s8(vx), vget_high_s8(vw));
+                int32x4_t s0 = vpaddlq_s16(p0);
+                int32x4_t s1 = vpadalq_s16(s0, p1);
+                int32x2_t r = vadd_s32(vget_low_s32(s1), vget_high_s32(s1));
+                int32_t ival = vget_lane_s32(r, 0) + vget_lane_s32(r, 1);
+#endif
+                val += ((float) ival) * w->s[(in + j) / 16] * x->s[g];
+            }
+        } else if (GS == 32) {
+            int num_groups = n / 32;
+            for (int g = 0; g < num_groups; g++) {
+                int j = g * 32;
+                int8x16_t vx0 = vld1q_s8(&x->q[j]);
+                int8x16_t vw0 = vld1q_s8(&w->q[in + j]);
+                int8x16_t vx1 = vld1q_s8(&x->q[j + 16]);
+                int8x16_t vw1 = vld1q_s8(&w->q[in + j + 16]);
+#if defined(__ARM_FEATURE_DOTPROD)
+                int32x4_t dot0 = vdotq_s32(vdupq_n_s32(0), vx0, vw0);
+                int32x4_t dot1 = vdotq_s32(dot0, vx1, vw1);
+                int32x2_t r = vadd_s32(vget_low_s32(dot1), vget_high_s32(dot1));
+                int32_t ival = vget_lane_s32(r, 0) + vget_lane_s32(r, 1);
+#else
+                int16x8_t p0 = vmull_s8(vget_low_s8(vx0), vget_low_s8(vw0));
+                int16x8_t p1 = vmull_s8(vget_high_s8(vx0), vget_high_s8(vw0));
+                int16x8_t p2 = vmull_s8(vget_low_s8(vx1), vget_low_s8(vw1));
+                int16x8_t p3 = vmull_s8(vget_high_s8(vx1), vget_high_s8(vw1));
+                int32x4_t s0 = vpaddlq_s16(p0);
+                int32x4_t s1 = vpadalq_s16(s0, p1);
+                int32x4_t s2 = vpadalq_s16(s1, p2);
+                int32x4_t s3 = vpadalq_s16(s2, p3);
+                int32x2_t r = vadd_s32(vget_low_s32(s3), vget_high_s32(s3));
+                int32_t ival = vget_lane_s32(r, 0) + vget_lane_s32(r, 1);
+#endif
+                val += ((float) ival) * w->s[(in + j) / 32] * x->s[g];
+            }
+        } else {
+            int32_t ival = 0;
+            for (int j = 0; j <= n - GS; j += GS) {
+                for (int k = 0; k < GS; k++)
+                    ival += ((int32_t) x->q[j + k]) * ((int32_t) w->q[in + j + k]);
+                val += ((float) ival) * w->s[(in + j) / GS] * x->s[j / GS];
+                ival = 0;
+            }
+        }
+#else
+        int32_t ival = 0;
+        for (int j = 0; j <= n - GS; j += GS) {
             for (int k = 0; k < GS; k++) {
                 ival += ((int32_t) x->q[j + k]) * ((int32_t) w->q[in + j + k]);
             }
             val += ((float) ival) * w->s[(in + j) / GS] * x->s[j / GS];
             ival = 0;
         }
-
+#endif
         xout[i] = val;
     }
 }
 
-float* forward(Transformer* transformer, int token, int pos) {
+float* forward(Transformer* transformer, int token, int pos, int compute_logits) {
 
     // a few convenience variables
     Config* p = &transformer->config;
@@ -498,12 +557,147 @@ float* forward(Transformer* transformer, int token, int pos) {
         }
     }
 
+    // Optimization #1: Skip computing logits for prompt tokens where next token is predetermined
+    if (!compute_logits) {
+        return NULL;
+    }
+
     // final rmsnorm
     rmsnorm(x, x, w->rms_final_weight, dim);
 
     // classifier into logits
     quantize(&s->xq, x, dim);
     matmul(s->logits, &s->xq, w->wcls, dim, p->vocab_size);
+    return s->logits;
+}
+
+// Optimization #2: Layer-by-Layer Prefill
+float* prefill_prompt(Transformer* transformer, int* prompt_tokens, int P) {
+    Config* p = &transformer->config;
+    TransformerWeights* w = &transformer->weights;
+    RunState* s = &transformer->state;
+    int dim = p->dim;
+    int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
+    int kv_mul = p->n_heads / p->n_kv_heads;
+    int hidden_dim = p->hidden_dim;
+    int head_size = dim / p->n_heads;
+
+    float* px = (float*)malloc((size_t)P * dim * sizeof(float));
+    for (int i = 0; i < P; i++) {
+        memcpy(px + (size_t)i * dim, w->token_embedding_table + (size_t)prompt_tokens[i] * dim, dim * sizeof(float));
+    }
+
+    for (int l = 0; l < p->n_layers; l++) {
+        int loff = l * p->seq_len * kv_dim;
+
+        // Attention across all prompt tokens
+        for (int pos = 0; pos < P; pos++) {
+            float* xp = px + (size_t)pos * dim;
+            rmsnorm(s->xb, xp, w->rms_att_weight + l * dim, dim);
+
+            quantize(&s->xq, s->xb, dim);
+            matmul(s->q, &s->xq, w->wq + l, dim, dim);
+            matmul(s->k, &s->xq, w->wk + l, dim, kv_dim);
+            matmul(s->v, &s->xq, w->wv + l, dim, kv_dim);
+
+            // RoPE
+            for (int i = 0; i < dim; i += 2) {
+                int head_dim = i % head_size;
+                float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
+                float val = pos * freq;
+                float fcr = cosf(val);
+                float fci = sinf(val);
+                int rotn = i < kv_dim ? 2 : 1;
+                for (int v = 0; v < rotn; v++) {
+                    float* vec = v == 0 ? s->q : s->k;
+                    float v0 = vec[i];
+                    float v1 = vec[i + 1];
+                    vec[i]   = v0 * fcr - v1 * fci;
+                    vec[i + 1] = v0 * fci + v1 * fcr;
+                }
+            }
+
+            float* key_cache_row = s->key_cache + loff + pos * kv_dim;
+            float* value_cache_row = s->value_cache + loff + pos * kv_dim;
+            memcpy(key_cache_row, s->k, kv_dim * sizeof(*key_cache_row));
+            memcpy(value_cache_row, s->v, kv_dim * sizeof(*value_cache_row));
+
+            int h;
+            #pragma omp parallel for private(h)
+            for (h = 0; h < p->n_heads; h++) {
+                float* q = s->q + h * head_size;
+                float* att = s->att + h * p->seq_len;
+                for (int t = 0; t <= pos; t++) {
+                    float* k = s->key_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
+                    float score = 0.0f;
+                    for (int i = 0; i < head_size; i++) {
+                        score += q[i] * k[i];
+                    }
+                    score /= sqrtf(head_size);
+                    att[t] = score;
+                }
+
+                softmax(att, pos + 1);
+
+                float* xb = s->xb + h * head_size;
+                memset(xb, 0, head_size * sizeof(float));
+                for (int t = 0; t <= pos; t++) {
+                    float* v = s->value_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
+                    float a = att[t];
+                    for (int i = 0; i < head_size; i++) {
+                        xb[i] += a * v[i];
+                    }
+                }
+            }
+
+            quantize(&s->xq, s->xb, dim);
+            matmul(s->xb2, &s->xq, w->wo + l, dim, dim);
+
+#ifdef PERI_LN
+            rmsnorm(s->xb2, s->xb2, w->rms_peri_attn + l * dim, dim);
+#endif
+            for (int i = 0; i < dim; i++) {
+                xp[i] += s->xb2[i];
+            }
+        }
+
+        // MLP block across all prompt tokens
+        for (int pos = 0; pos < P; pos++) {
+            float* xp = px + (size_t)pos * dim;
+            rmsnorm(s->xb, xp, w->rms_ffn_weight + l * dim, dim);
+
+            quantize(&s->xq, s->xb, dim);
+            matmul(s->hb, &s->xq, w->w1 + l, dim, hidden_dim);
+            matmul(s->hb2, &s->xq, w->w3 + l, dim, hidden_dim);
+
+            for (int i = 0; i < hidden_dim; i++) {
+                float val = s->hb[i];
+#ifdef ACT_GELU
+                val = 0.5f * val * (1.0f + erff(val * 0.70710678118654752440f));
+#else
+                val *= (1.0f / (1.0f + expf(-val)));
+#endif
+                val *= s->hb2[i];
+                s->hb[i] = val;
+            }
+
+            quantize(&s->hq, s->hb, hidden_dim);
+            matmul(s->xb, &s->hq, w->w2 + l, hidden_dim, dim);
+
+#ifdef PERI_LN
+            rmsnorm(s->xb, s->xb, w->rms_peri_mlp + l * dim, dim);
+#endif
+            for (int i = 0; i < dim; i++) {
+                xp[i] += s->xb[i];
+            }
+        }
+    }
+
+    float* last_x = px + (size_t)(P - 1) * dim;
+    rmsnorm(s->x, last_x, w->rms_final_weight, dim);
+    quantize(&s->xq, s->x, dim);
+    matmul(s->logits, &s->xq, w->wcls, dim, p->vocab_size);
+    free(px);
     return s->logits;
 }
 
@@ -876,7 +1070,6 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
     char *empty_prompt = "";
     if (prompt == NULL) { prompt = empty_prompt; }
 
-    // encode the (string) prompt into tokens sequence
     int num_prompt_tokens = 0;
     int* prompt_tokens = (int*)malloc((strlen(prompt)+3) * sizeof(int)); // +3 for '\0', ?BOS, ?EOS
     encode(tokenizer, prompt, 1, 0, prompt_tokens, &num_prompt_tokens);
@@ -884,46 +1077,44 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
         fprintf(stderr, "something is wrong, expected at least 1 prompt token\n");
         exit(EXIT_FAILURE);
     }
+    if (num_prompt_tokens >= steps) {
+        fprintf(stderr, "WARNING: Prompt token count (%d) >= total allowed steps (%d, model max context seq_len is %d).\n",
+                num_prompt_tokens, steps, transformer->config.seq_len);
+    }
 
-    // start the main loop
-    long start = 0;  // used to time our code, only initialized after first iteration
-    int next;        // will store the next token in the sequence
-    int token = prompt_tokens[0]; // kick off with the first token in the prompt
-    int pos = 0;     // position in the sequence
+    long t_start = time_in_ms();
+    float* logits = prefill_prompt(transformer, prompt_tokens, num_prompt_tokens);
+    int next = sample(sampler, logits);
+    long t_prefill_end = time_in_ms();
+
+    int pos = num_prompt_tokens;
+    int token = next;
+
+    char* piece = decode(tokenizer, prompt_tokens[0], next);
+    safe_printf(piece);
+    fflush(stdout);
+
     while (pos < steps) {
-
-        // forward the transformer to get logits for the next token
-        float* logits = forward(transformer, token, pos);
-
-        // advance the state state machine
-        if (pos < num_prompt_tokens - 1) {
-            // if we are still processing the input prompt, force the next prompt token
-            next = prompt_tokens[pos + 1];
-        } else {
-            // otherwise sample the next token from the logits
-            next = sample(sampler, logits);
-        }
-        pos++;
-
-        // data-dependent terminating condition: the BOS (=1) token delimits sequences
         if (next == 1) { break; }
-
-        // print the token as string, decode it with the Tokenizer object
-        char* piece = decode(tokenizer, token, next);
-        safe_printf(piece); // same as printf("%s", piece), but skips "unsafe" bytes
+        logits = forward(transformer, token, pos, 1);
+        next = sample(sampler, logits);
+        pos++;
+        piece = decode(tokenizer, token, next);
+        safe_printf(piece);
         fflush(stdout);
         token = next;
-
-        // init the timer here because the first iteration can be slower
-        if (start == 0) { start = time_in_ms(); }
     }
     printf("\n");
 
-    // report achieved tok/s (pos-1 because the timer starts after first iteration)
-    if (pos > 1) {
-        long end = time_in_ms();
-        fprintf(stderr, "achieved tok/s: %f\n", (pos-1) / (double)(end-start)*1000);
-    }
+    long t_end = time_in_ms();
+    double prefill_duration_ms = (double)(t_prefill_end - t_start);
+    int decode_count = (pos > num_prompt_tokens) ? (pos - num_prompt_tokens) : 0;
+    double decode_duration_ms = (double)(t_end - t_prefill_end);
+    double decode_tok_s = (decode_count > 0 && decode_duration_ms > 0) ? (decode_count / decode_duration_ms * 1000.0) : 0.0;
+    double total_tok_s = (pos > 1 && (t_end - t_start) > 0) ? ((pos - 1) / (double)(t_end - t_start) * 1000.0) : 0.0;
+
+    fprintf(stderr, "prefill_tokens: %d, prefill_ms: %.2f, ttft_ms: %.2f, decode_tokens: %d, decode_tok_s: %.2f, achieved tok/s: %.6f\n",
+            num_prompt_tokens, prefill_duration_ms, prefill_duration_ms, decode_count, decode_tok_s, total_tok_s);
 
     free(prompt_tokens);
 }
@@ -949,11 +1140,14 @@ void generate_ids(Transformer *transformer, Sampler *sampler, char *ids_path, in
         }
     }
 
-    int next, token = prompt_tokens[0], pos = 0;
+    float* logits = prefill_prompt(transformer, prompt_tokens, n);
+    int next = sample(sampler, logits);
+    printf("%d\n", next);
+    int token = next;
+    int pos = n;
     while (pos < steps) {
-        float* logits = forward(transformer, token, pos);
-        if (pos < n - 1) { next = prompt_tokens[pos + 1]; }
-        else { next = sample(sampler, logits); }
+        logits = forward(transformer, token, pos, 1);
+        next = sample(sampler, logits);
         pos++;
         printf("%d\n", next);
         token = next;
@@ -974,23 +1168,30 @@ void generate_gpt2(Transformer *transformer, Sampler *sampler, GPT2Tokenizer *to
     { int blen0; const unsigned char* b0 = gpt2_token_bytes(tok, prompt_tokens[0], &blen0);
       fwrite(b0, 1, blen0, stdout); }
 
-    long start = 0;
-    int next, token = prompt_tokens[0], pos = 0;
-    while (pos < steps) {
-        float* logits = forward(transformer, token, pos);
-        if (pos < num_prompt_tokens - 1) { next = prompt_tokens[pos + 1]; }
-        else { next = sample(sampler, logits); }
-        pos++;
-        if (next == tok->eot) break;
+    long t_start = time_in_ms();
+    float* logits = prefill_prompt(transformer, prompt_tokens, num_prompt_tokens);
+    int next = sample(sampler, logits);
+    long t_prefill_end = time_in_ms();
+
+    int pos = num_prompt_tokens;
+    if (next != tok->eot) {
         int blen; const unsigned char* b = gpt2_token_bytes(tok, next, &blen);
         fwrite(b, 1, blen, stdout); fflush(stdout);
-        token = next;
-        if (start == 0) start = time_in_ms();
+        int token = next;
+        while (pos < steps) {
+            logits = forward(transformer, token, pos, 1);
+            next = sample(sampler, logits);
+            pos++;
+            if (next == tok->eot) break;
+            blen = 0; b = gpt2_token_bytes(tok, next, &blen);
+            fwrite(b, 1, blen, stdout); fflush(stdout);
+            token = next;
+        }
     }
     printf("\n");
     if (pos > 1) {
         long end = time_in_ms();
-        fprintf(stderr, "achieved tok/s: %f\n", (pos-1) / (double)(end-start)*1000);
+        fprintf(stderr, "achieved tok/s: %f\n", (pos-1) / (double)(end-t_start)*1000);
     }
     free(prompt_tokens);
 }
@@ -1080,7 +1281,8 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
         if (token == 2) { user_turn = 1; }
 
         // forward the transformer to get logits for the next token
-        float* logits = forward(transformer, token, pos);
+        int compute_logits = (user_idx >= num_prompt_tokens);
+        float* logits = forward(transformer, token, pos, compute_logits);
         next = sample(sampler, logits);
         pos++;
 
@@ -1162,8 +1364,15 @@ int main(int argc, char *argv[]) {
 
     // build the Transformer via the model .bin file
     Transformer transformer;
-    build_transformer(&transformer, checkpoint_path);
-    if (steps == 0 || steps > transformer.config.seq_len) steps = transformer.config.seq_len; // override to ~max length
+    read_checkpoint(checkpoint_path, &transformer.config, &transformer.weights, &transformer.fd, &transformer.data, &transformer.file_size);
+
+    // Dynamic sequence length expansion: expand context window if requested steps > checkpoint default seq_len
+    if (steps > transformer.config.seq_len) {
+        fprintf(stderr, "[INFO] Dynamically expanding sequence length context window: %d -> %d\n",
+                transformer.config.seq_len, steps);
+        transformer.config.seq_len = steps;
+    }
+    malloc_run_state(&transformer.state, &transformer.config);
 
     // build the Sampler
     Sampler sampler;
