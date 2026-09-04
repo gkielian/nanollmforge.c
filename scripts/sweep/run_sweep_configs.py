@@ -72,11 +72,56 @@ def find_tokenizer_gpt2():
             return c
     return None
 
-def ensure_compiled_and_pushed(adb_base):
+def wake_and_keep_awake(adb_base):
     try:
-        arch_res = subprocess.run(adb_base + ["shell", "uname -m"], capture_output=True, text=True, check=True)
-        arch = arch_res.stdout.strip()
+        subprocess.run(adb_base + ["shell", "input keyevent KEYCODE_WAKEUP 2>/dev/null || true; svc power stayon true 2>/dev/null || true; settings put system screen_off_timeout 86400000 2>/dev/null || true"], capture_output=True, timeout=5)
     except Exception:
+        pass
+
+def adb_push_with_retry(adb_base, local_path, remote_path, max_retries=4):
+    for attempt in range(1, max_retries + 1):
+        res = subprocess.run(adb_base + ["push", local_path, remote_path], capture_output=True, text=True)
+        if res.returncode == 0:
+            return True
+        print(f"⚠️ ADB push '{local_path}' -> '{remote_path}' failed (attempt {attempt}/{max_retries}): {res.stderr.strip()}")
+        time.sleep(1.5)
+        # Try reconnecting if wireless ADB target
+        if "-s" in adb_base:
+            s_idx = adb_base.index("-s") + 1
+            serial = adb_base[s_idx]
+            if ":" in serial:
+                print(f"Reconnecting ADB to {serial}...")
+                subprocess.run([adb_base[0], "disconnect", serial], capture_output=True)
+                time.sleep(0.5)
+                subprocess.run([adb_base[0], "connect", serial], capture_output=True)
+                wake_and_keep_awake(adb_base)
+                time.sleep(1.0)
+    res.check_returncode()
+
+def ensure_compiled_and_pushed(adb_base):
+    wake_and_keep_awake(adb_base)
+    arch = None
+    for attempt in range(3):
+        try:
+            arch_res = subprocess.run(adb_base + ["shell", "uname -m"], capture_output=True, text=True, check=True)
+            arch = arch_res.stdout.strip()
+            if arch:
+                break
+        except Exception:
+            if "-s" in adb_base:
+                s_idx = adb_base.index("-s") + 1
+                serial = adb_base[s_idx]
+                if ":" in serial:
+                    print(f"Connecting/Reconnecting ADB to {serial} (attempt {attempt+1}/3)...")
+                    subprocess.run([adb_base[0], "disconnect", serial], capture_output=True)
+                    time.sleep(0.5)
+                    subprocess.run([adb_base[0], "connect", serial], capture_output=True)
+                    wake_and_keep_awake(adb_base)
+                    time.sleep(1.0)
+            else:
+                time.sleep(1.0)
+
+    if not arch:
         print("\n" + "="*60)
         print("❌ Error: No Android device connected over ADB.")
         print("Please connect your device via USB or Wi-Fi ADB:")
@@ -90,29 +135,29 @@ def ensure_compiled_and_pushed(adb_base):
         print(f"Error: NDK compiler not found for {arch}. Please set NDK or ANDROID_NDK_HOME environment variable.")
         sys.exit(1)
 
-    print(f"Compiling runq_reallm for {arch} using {os.path.basename(compiler)}...")
-    cmd = [compiler, "-O3", "-Isrc", "-o", "runq_reallm_device", "src/runq_reallm.c", "-lm"]
+    print(f"Compiling runq_reallm for {arch} using {os.path.basename(compiler)} (OpenMP 4-core Batched GEMM + Cortex-A53 tuned)...")
+    cmd = [compiler, "-O3", "-march=armv8-a", "-mcpu=cortex-a53", "-mfpu=neon-fp-armv8", "-ffast-math", "-fopenmp", "-static-openmp", "-Isrc", "-o", "runq_reallm_device", "src/runq_reallm.c", "-lm"]
     subprocess.run(cmd, check=True)
     
     if os.path.exists("src/power_sampler.c"):
         print("Compiling power_sampler for device...")
         cmd_ps = [compiler, "-O3", "-o", "power_sampler_device", "src/power_sampler.c"]
         subprocess.run(cmd_ps, check=True)
-        subprocess.run(adb_base + ["push", "power_sampler_device", "/data/local/tmp/power_sampler"], capture_output=True, check=True)
+        adb_push_with_retry(adb_base, "power_sampler_device", "/data/local/tmp/power_sampler")
         subprocess.run(adb_base + ["shell", "chmod +x /data/local/tmp/power_sampler"], capture_output=True, check=True)
         if os.path.exists("power_sampler_device"):
             os.remove("power_sampler_device")
 
     print("Pushing runq_reallm engine and tokenizer to device...")
-    subprocess.run(adb_base + ["push", "runq_reallm_device", "/data/local/tmp/runq_reallm"], check=True)
-    subprocess.run(adb_base + ["shell", "chmod +x /data/local/tmp/runq_reallm"], check=True)
+    adb_push_with_retry(adb_base, "runq_reallm_device", "/data/local/tmp/runq_reallm")
+    subprocess.run(adb_base + ["shell", "chmod +x /data/local/tmp/runq_reallm"], capture_output=True, check=True)
     if os.path.exists("runq_reallm_device"):
         os.remove("runq_reallm_device")
 
     tok_path = find_tokenizer_gpt2()
     if tok_path:
         print(f"Pushing tokenizer ({tok_path}) -> /data/local/tmp/tokenizer_gpt2.bin...")
-        subprocess.run(adb_base + ["push", tok_path, "/data/local/tmp/tokenizer_gpt2.bin"], capture_output=True, check=True)
+        adb_push_with_retry(adb_base, tok_path, "/data/local/tmp/tokenizer_gpt2.bin")
     else:
         print("Warning: tokenizer_gpt2.bin not found locally! Ensure it exists on device.")
 
@@ -187,8 +232,9 @@ def build_prompt_for_tokens(target_prefill_tokens):
 
 
 
+
 def run_benchmark_with_power(adb_base, prefill_tokens=128, decode_steps=64, sample_rate=10.0, pre_idle_sec=4.0, post_idle_sec=4.0):
-    subprocess.run(adb_base + ["push", LOCAL_RLM, f"/data/local/tmp/{LOCAL_RLM}"], capture_output=True, check=True)
+    adb_push_with_retry(adb_base, LOCAL_RLM, f"/data/local/tmp/{LOCAL_RLM}")
     
     prompt_str = build_prompt_for_tokens(prefill_tokens)
     total_steps = prefill_tokens + decode_steps
@@ -202,6 +248,7 @@ cd /data/local/tmp
 input keyevent KEYCODE_WAKEUP 2>/dev/null || true
 svc power stayon true 2>/dev/null || true
 settings put system screen_off_timeout 86400000 2>/dev/null || true
+export OMP_NUM_THREADS=4
 
 sleep 0.8
 
@@ -335,9 +382,96 @@ def get_existing_completed_config_ids(out_csv):
                     completed.add(row[0].strip())
     return completed
 
-def main():
-    parser = argparse.ArgumentParser(description="Sweep LLM architecture configurations on physical Android device from CSV input.")
-    parser.add_argument("--config", type=str, default=DEFAULT_CONFIG_PATH, help="Path to input CSV config file")
+def get_device_telemetry(adb_base):
+    cmd = """
+    cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq 2>/dev/null || echo 0;
+    cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq 2>/dev/null || echo 0;
+    cat /sys/class/thermal/thermal_zone17/temp 2>/dev/null || echo 0;
+    cat /sys/class/thermal/thermal_zone6/temp 2>/dev/null || echo 0;
+    cat /sys/class/thermal/cooling_device1/cur_state 2>/dev/null || cat /sys/class/thermal/cooling_device0/cur_state 2>/dev/null || echo 0;
+    cat /sys/class/power_supply/battery/voltage_now 2>/dev/null || echo 0;
+    cat /sys/class/power_supply/battery/current_now 2>/dev/null || echo 0;
+    """
+    try:
+        res = subprocess.run(adb_base + ["shell", cmd], capture_output=True, text=True, timeout=10)
+        lines = [l.strip() for l in res.stdout.strip().splitlines() if l.strip()]
+        if len(lines) >= 7:
+            freq_khz = int(lines[0]) if lines[0].isdigit() else 0
+            max_freq_khz = int(lines[1]) if lines[1].isdigit() else 1900800
+            cpu_temp = float(lines[2]) / 1000.0 if lines[2].isdigit() else 0.0
+            skin_temp = float(lines[3]) / 1000.0 if lines[3].isdigit() else 0.0
+            cdev = int(lines[4]) if lines[4].isdigit() else 0
+            volt = float(lines[5]) / 1e6 if lines[5].isdigit() else 0.0
+            curr = float(lines[6]) / 1000.0 if (lines[6].isdigit() or lines[6].startswith("-")) else 0.0
+            return {
+                "freq_khz": freq_khz,
+                "freq_mhz": freq_khz / 1000.0,
+                "max_freq_mhz": max_freq_khz / 1000.0,
+                "cpu_temp_c": cpu_temp,
+                "skin_temp_c": skin_temp,
+                "cooling_state": cdev,
+                "voltage_v": volt,
+                "current_ma": curr
+            }
+    except Exception:
+        pass
+    return None
+
+def wait_for_thermal_and_voltage_recovery(adb_base, target_cpu_temp=44.0, max_wait_sec=180.0, poll_interval=2.0, min_voltage_v=3.5):
+    """
+    Monitors device thermal, CPU frequency, and battery voltage.
+    Prioritizes MAX CPU Frequency (1.90 GHz) and Cooling Device Level 0.
+    As long as frequency is unclamped (1.90 GHz) and cooling state is 0,
+    inference runs immediately without unnecessary thermal wait.
+    """
+    t0 = time.time()
+    was_throttled = False
+
+    while True:
+        telem = get_device_telemetry(adb_base)
+        if not telem:
+            time.sleep(poll_interval)
+            if time.time() - t0 > max_wait_sec:
+                break
+            continue
+
+        cdev = telem["cooling_state"]
+        freq_mhz = telem["freq_mhz"]
+        cpu_temp = telem["cpu_temp_c"]
+        volt = telem["voltage_v"]
+
+        # Primary condition: CPU must be running at nominal max clock (1.90 GHz) with zero thermal mitigation
+        is_freq_clamped = freq_mhz < 1850.0
+        is_cdev_active = cdev > 0
+        # Secondary safety ceiling (only if target_cpu_temp > 0)
+        is_hot = (target_cpu_temp > 0.0) and (cpu_temp > target_cpu_temp)
+        is_volt_sagging = volt > 0 and volt < min_voltage_v
+
+        needs_cooldown = is_freq_clamped or is_cdev_active or is_hot or is_volt_sagging
+
+        if not needs_cooldown:
+            if was_throttled:
+                time.sleep(1.0)
+                telem_post = get_device_telemetry(adb_base) or telem
+                print(f"\n  [Frequency Guard] ✅ Max frequency restored (1.90 GHz, CoolState: 0, CPU: {telem_post['cpu_temp_c']:.1f}°C, Volt: {telem_post['voltage_v']:.2f}V). Resuming sweep.")
+            return telem
+
+        was_throttled = True
+        elapsed = time.time() - t0
+        if elapsed > max_wait_sec:
+            print(f"\n  [Frequency Guard] ⚠️ Wait timeout ({max_wait_sec}s). Resuming: CPU={cpu_temp:.1f}°C, Freq={freq_mhz:.0f}MHz, CoolState={cdev}, Volt={volt:.2f}V.")
+            return telem
+
+        reasons = []
+        if is_freq_clamped: reasons.append(f"Freq={freq_mhz:.0f}MHz (clamped < 1900MHz)")
+        if is_cdev_active: reasons.append(f"CoolState={cdev}")
+        if is_hot: reasons.append(f"CPU={cpu_temp:.1f}°C > {target_cpu_temp:.1f}°C")
+        if is_volt_sagging: reasons.append(f"Volt={volt:.2f}V < {min_voltage_v}V")
+        reason_str = ", ".join(reasons)
+
+        print(f"  [Frequency Guard] Throttling active ({reason_str})! Waiting for max frequency recovery... ({elapsed:.0f}s elapsed)", end="\r", flush=True)
+        time.sleep(poll_interval)
+
 def measure_inter_run_idle_power(adb_base, duration_sec=3.0, sample_rate=10.0):
     interval_ms = max(5, int((1.0 / sample_rate) * 1000))
     remote_script = f"""#!/bin/sh
@@ -403,20 +537,55 @@ echo "DONE"
     return mean_p, mean_i, mean_v
 
 def main():
-    parser = argparse.ArgumentParser(description="Sweep LLM architecture configurations on physical Android device from CSV input.")
+    parser = argparse.ArgumentParser(description="Sweep LLM architecture configurations on physical Android device with Throttling & Thermal Recovery Protection.")
     parser.add_argument("--config", type=str, default=DEFAULT_CONFIG_PATH, help="Path to input CSV config file")
     parser.add_argument("--out", type=str, default=DEFAULT_OUT_CSV, help="Path to output CSV results file")
     parser.add_argument("--serial", type=str, default=os.environ.get("ANDROID_SERIAL", ""), help="Device serial or IP:port")
     parser.add_argument("--adb", type=str, default=find_adb(), help="Path to adb binary")
-    parser.add_argument("--prefill-tokens", type=int, default=128, help="Target prefill prompt tokens (default: 128)")
-    parser.add_argument("--steps", type=int, default=64, help="Decoding steps per config (default: 64)")
+    parser.add_argument("--prefill-tokens", type=int, default=48, help="Target prefill prompt tokens (default: 48)")
+    parser.add_argument("--steps", type=int, default=16, help="Decoding steps per config (default: 16)")
     parser.add_argument("--sample-rate", type=float, default=10.0, help="Power sampling frequency in Hz (default: 10.0)")
     parser.add_argument("--inter-run-idle-sec", "--idle-between-runs", type=float, default=0.0, help="Optional idle battery sampling duration in seconds between config runs (default: 0.0, disabled)")
+    parser.add_argument("--cool-down-temp", type=float, default=44.0, help="Target safety CPU temperature ceiling (°C). Set 0 to disable temp ceiling and rely purely on max clock (default: 44.0)")
+    parser.add_argument("--min-cooldown-sec", type=float, default=2.0, help="Minimum pause between runs for voltage/thermal settling (default: 2.0s)")
+    parser.add_argument("--max-cool-wait", type=float, default=180.0, help="Max seconds to wait for thermal/voltage recovery (default: 180.0)")
+    parser.add_argument("--no-cooldown", action="store_true", help="Disable automatic thermal cooldown and voltage recovery wait")
     args = parser.parse_args()
 
     if not os.path.exists(args.config):
         print(f"Error: Config file {args.config} not found.")
         sys.exit(1)
+
+    if not args.serial:
+        res = subprocess.run([args.adb, "devices"], capture_output=True, text=True)
+        active_devices = []
+        offline_devices = []
+        for line in res.stdout.strip().splitlines()[1:]:
+            parts = line.strip().split()
+            if len(parts) >= 2:
+                if parts[1] == "device":
+                    active_devices.append(parts[0])
+                elif parts[1] == "offline":
+                    offline_devices.append(parts[0])
+
+        if not active_devices and offline_devices:
+            for off in offline_devices:
+                if ":" in off:
+                    print(f"Device {off} is offline. Attempting automatic reconnection...")
+                    subprocess.run([args.adb, "disconnect", off], capture_output=True)
+                    time.sleep(0.5)
+                    subprocess.run([args.adb, "connect", off], capture_output=True)
+            time.sleep(1.0)
+            res = subprocess.run([args.adb, "devices"], capture_output=True, text=True)
+            for line in res.stdout.strip().splitlines()[1:]:
+                parts = line.strip().split()
+                if len(parts) >= 2 and parts[1] == "device":
+                    active_devices.append(parts[0])
+
+        if active_devices:
+            args.serial = active_devices[0]
+        elif offline_devices:
+            args.serial = offline_devices[0]
 
     adb_base = [args.adb]
     if args.serial:
@@ -424,26 +593,36 @@ def main():
 
     print("==========================================================")
     print("Executing LLM Architecture Sweep on Physical Device")
-    print(f"Config CSV : {args.config}")
-    print(f"Output CSV : {args.out}")
-    print(f"Device     : {args.serial if args.serial else 'default connected device'}")
-    print(f"Prefill    : ~{args.prefill_tokens} prompt tokens")
-    print(f"Decode     : {args.steps} generated tokens")
+    print(f"Config CSV   : {args.config}")
+    print(f"Output CSV   : {args.out}")
+    print(f"Device       : {args.serial if args.serial else 'default connected device'}")
+    print(f"Prefill      : ~{args.prefill_tokens} prompt tokens")
+    print(f"Decode       : {args.steps} generated tokens")
+    print(f"Thermal Guard: Target CPU <= {args.cool_down_temp:.1f}°C (Cooldown protection: {'OFF' if args.no_cooldown else 'ON'})")
     if args.inter_run_idle_sec > 0:
-        print(f"Inter-Idle : {args.inter_run_idle_sec:.1f}s sampling between runs")
+        print(f"Inter-Idle   : {args.inter_run_idle_sec:.1f}s sampling between runs")
     print("==========================================================")
 
     arch = ensure_compiled_and_pushed(adb_base)
 
-    os.makedirs(os.path.dirname(args.out), exist_ok=True)
+    os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
+    csv_header_v2 = [
+        "config_id", "category", "n_layer", "d_model", "n_h", "n_kv", "d_qk", "d_v", "d_mlp",
+        "decode_tok_s", "ttft_ms", "tpot_ms", "duration_s", "baseline_power_w", "active_power_w", "peak_power_w",
+        "dynamic_power_w", "total_energy_j", "dynamic_energy_per_token_mj",
+        "temp_cpu_start_c", "temp_cpu_end_c", "cooling_state", "cpu_freq_mhz", "voltage_v", "notes"
+    ]
+    
+    is_legacy_header = False
     if not os.path.exists(args.out):
         with open(args.out, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow([
-                "config_id", "category", "n_layer", "d_model", "n_h", "n_kv", "d_qk", "d_v", "d_mlp",
-                "decode_tok_s", "ttft_ms", "tpot_ms", "duration_s", "baseline_power_w", "active_power_w", "peak_power_w",
-                "dynamic_power_w", "total_energy_j", "dynamic_energy_per_token_mj", "notes"
-            ])
+            writer.writerow(csv_header_v2)
+    else:
+        with open(args.out, "r", encoding="utf-8", errors="replace") as f:
+            first_line = f.readline()
+            if "temp_cpu_start_c" not in first_line:
+                is_legacy_header = True
 
     completed_ids = get_existing_completed_config_ids(args.out)
 
@@ -475,11 +654,26 @@ def main():
             print(f"[{idx}/{total_runs}] Skipping completed: {config_id}")
             continue
 
+        # 1. Thermal, Frequency & Voltage Recovery Guard
+        if not args.no_cooldown:
+            telem_start = wait_for_thermal_and_voltage_recovery(
+                adb_base,
+                target_cpu_temp=args.cool_down_temp,
+                max_wait_sec=args.max_cool_wait
+            )
+        else:
+            telem_start = get_device_telemetry(adb_base)
+
+        if args.min_cooldown_sec > 0:
+            time.sleep(args.min_cooldown_sec)
+
         if args.inter_run_idle_sec > 0:
             p_idle, i_idle, v_idle = measure_inter_run_idle_power(adb_base, duration_sec=args.inter_run_idle_sec, sample_rate=args.sample_rate)
             print(f"  [Inter-Run Idle] Battery power: {p_idle*1000.0:.1f} mW ({i_idle:.1f} mA @ {v_idle:.2f} V)")
 
-        print(f"\n[{idx}/{total_runs}] Profiling Config '{config_id}' ({category})...")
+        temp_start_c = telem_start["cpu_temp_c"] if telem_start else 0.0
+        volt_start_v = telem_start["voltage_v"] if telem_start else 0.0
+        print(f"\n[{idx}/{total_runs}] Profiling Config '{config_id}' ({category}) [CPU Temp: {temp_start_c:.1f}°C, Volt: {volt_start_v:.2f}V]...")
         print(f"  Specs: n_layer={n_layer}, d_model={d_model}, n_h={n_h}, n_kv={n_kv}, d_qk={d_qk}, d_v={d_v}, d_mlp={d_mlp}")
 
         try:
@@ -493,18 +687,36 @@ def main():
                 sample_rate=args.sample_rate
             )
 
-            with open(args.out, "a", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow([
-                    config_id, category, n_layer, d_model, n_h, n_kv, d_qk, d_v, d_mlp,
-                    f"{metrics['tok_s']:.4f}", f"{metrics['ttft_ms']:.2f}", f"{metrics['tpot_ms']:.2f}", f"{metrics['duration_s']:.4f}",
-                    f"{metrics['baseline_power_w']:.4f}", f"{metrics['active_power_w']:.4f}",
-                    f"{metrics['peak_power_w']:.4f}", f"{metrics['dynamic_power_w']:.4f}",
-                    f"{metrics['total_energy_j']:.4f}", f"{metrics['dynamic_energy_per_token_mj']:.4f}",
-                    notes
-                ])
+            # Sample ending telemetry
+            telem_end = get_device_telemetry(adb_base)
+            temp_end_c = telem_end["cpu_temp_c"] if telem_end else 0.0
+            cooling_state_end = telem_end["cooling_state"] if telem_end else 0
+            freq_end_mhz = telem_end["freq_mhz"] if telem_end else 0.0
+            volt_end_v = telem_end["voltage_v"] if telem_end else 0.0
 
-            print(f"  -> decode tok/s: {metrics['tok_s']:.2f} | TTFT: {metrics['ttft_ms']:.1f}ms | TPOT: {metrics['tpot_ms']:.2f}ms/tok | active power: {metrics['active_power_w']*1000:.1f}mW | dynamic energy/tok: {metrics['dynamic_energy_per_token_mj']:.1f} mJ/tok")
+            with open(args.out, "a", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                if is_legacy_header:
+                    writer.writerow([
+                        config_id, category, n_layer, d_model, n_h, n_kv, d_qk, d_v, d_mlp,
+                        f"{metrics['tok_s']:.4f}", f"{metrics['ttft_ms']:.2f}", f"{metrics['tpot_ms']:.2f}", f"{metrics['duration_s']:.4f}",
+                        f"{metrics['baseline_power_w']:.4f}", f"{metrics['active_power_w']:.4f}",
+                        f"{metrics['peak_power_w']:.4f}", f"{metrics['dynamic_power_w']:.4f}",
+                        f"{metrics['total_energy_j']:.4f}", f"{metrics['dynamic_energy_per_token_mj']:.4f}",
+                        notes
+                    ])
+                else:
+                    writer.writerow([
+                        config_id, category, n_layer, d_model, n_h, n_kv, d_qk, d_v, d_mlp,
+                        f"{metrics['tok_s']:.4f}", f"{metrics['ttft_ms']:.2f}", f"{metrics['tpot_ms']:.2f}", f"{metrics['duration_s']:.4f}",
+                        f"{metrics['baseline_power_w']:.4f}", f"{metrics['active_power_w']:.4f}",
+                        f"{metrics['peak_power_w']:.4f}", f"{metrics['dynamic_power_w']:.4f}",
+                        f"{metrics['total_energy_j']:.4f}", f"{metrics['dynamic_energy_per_token_mj']:.4f}",
+                        f"{temp_start_c:.1f}", f"{temp_end_c:.1f}", cooling_state_end, f"{freq_end_mhz:.1f}", f"{volt_end_v:.3f}",
+                        notes
+                    ])
+
+            print(f"  -> decode tok/s: {metrics['tok_s']:.2f} | TTFT: {metrics['ttft_ms']:.1f}ms | TPOT: {metrics['tpot_ms']:.2f}ms/tok | active power: {metrics['active_power_w']*1000:.1f}mW | CPU Temp: {temp_start_c:.1f}°C -> {temp_end_c:.1f}°C (CoolState: {cooling_state_end})")
 
         except Exception as e:
             print(f"  -> Error profiling config {config_id}: {e}")
@@ -520,3 +732,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
