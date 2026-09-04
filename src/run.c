@@ -240,7 +240,7 @@ void matmul(float* xout, float* x, float* w, int n, int d) {
     }
 }
 
-float* forward(Transformer* transformer, int token, int pos) {
+float* forward(Transformer* transformer, int token, int pos, int compute_logits) {
 
     // a few convenience variables
     Config* p = &transformer->config;
@@ -378,6 +378,11 @@ float* forward(Transformer* transformer, int token, int pos) {
         for (int i = 0; i < dim; i++) {
             x[i] += s->xb[i];
         }
+    }
+
+    // Optimization #1: Skip computing logits for prompt tokens where next token is predetermined
+    if (!compute_logits) {
+        return NULL;
     }
 
     // final rmsnorm
@@ -774,7 +779,8 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
     while (pos < steps) {
 
         // forward the transformer to get logits for the next token
-        float* logits = forward(transformer, token, pos);
+        int compute_logits = (pos >= num_prompt_tokens - 1);
+        float* logits = forward(transformer, token, pos, compute_logits);
 
         // advance the state machine
         if (pos < num_prompt_tokens - 1) {
@@ -835,7 +841,8 @@ void generate_ids(Transformer *transformer, Sampler *sampler, char *ids_path, in
 
     int next, token = prompt_tokens[0], pos = 0;
     while (pos < steps) {
-        float* logits = forward(transformer, token, pos);
+        int compute_logits = (pos >= n - 1);
+        float* logits = forward(transformer, token, pos, compute_logits);
         if (pos < n - 1) {
             next = prompt_tokens[pos + 1];   // still consuming the prompt
         } else {
@@ -864,7 +871,8 @@ void generate_gpt2(Transformer *transformer, Sampler *sampler, GPT2Tokenizer *to
     long start = 0;
     int next, token = prompt_tokens[0], pos = 0;
     while (pos < steps) {
-        float* logits = forward(transformer, token, pos);
+        int compute_logits = (pos >= num_prompt_tokens - 1);
+        float* logits = forward(transformer, token, pos, compute_logits);
         if (pos < num_prompt_tokens - 1) { next = prompt_tokens[pos + 1]; }
         else { next = sample(sampler, logits); }
         pos++;
@@ -967,7 +975,8 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
         if (token == 2) { user_turn = 1; }
 
         // forward the transformer to get logits for the next token
-        float* logits = forward(transformer, token, pos);
+        int compute_logits = (user_idx >= num_prompt_tokens);
+        float* logits = forward(transformer, token, pos, compute_logits);
         next = sample(sampler, logits);
         pos++;
 
