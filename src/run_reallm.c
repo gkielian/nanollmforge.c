@@ -275,7 +275,7 @@ static void rope_apply(float* vec, int n_groups, int head_size, int pos, float t
     }
 }
 
-float* forward(Transformer* t, int token, int pos) {
+float* forward(Transformer* t, int token, int pos, int compute_logits) {
     Config* c = &t->config;
     Weights* w = &t->weights;
     RunState* s = &t->state;
@@ -342,6 +342,11 @@ float* forward(Transformer* t, int token, int pos) {
         matmul(s->xb, s->hb, L->w2, hidden, dim);      // down -> mlp_out
         rmsnorm(s->xb2, s->xb, L->peri_ln_mlp, dim);
         for (int i = 0; i < dim; i++) x[i] += s->xb2[i];
+    }
+
+    // Optimization #1: Skip computing logits for prompt tokens where next token is predetermined
+    if (!compute_logits) {
+        return NULL;
     }
 
     rmsnorm(x, x, w->ln_f, dim);
@@ -439,7 +444,8 @@ void generate_ids(Transformer* t, Sampler* sampler, char* ids_path, int steps) {
     }
     int next, token = prompt[0], pos = 0;
     while (pos < steps) {
-        float* logits = forward(t, token, pos);
+        int compute_logits = (pos >= n - 1);
+        float* logits = forward(t, token, pos, compute_logits);
         if (pos < n - 1) next = prompt[pos + 1];
         else next = sample(sampler, logits);
         pos++;
@@ -464,7 +470,8 @@ void generate_gpt2(Transformer* t, Sampler* sampler, GPT2Tokenizer* tok, char* p
     long start = 0;
     int next, token = prompt_tokens[0], pos = 0;
     while (pos < steps) {
-        float* logits = forward(t, token, pos);
+        int compute_logits = (pos >= num_prompt_tokens - 1);
+        float* logits = forward(t, token, pos, compute_logits);
         if (pos < num_prompt_tokens - 1) next = prompt_tokens[pos + 1];
         else next = sample(sampler, logits);
         pos++;
